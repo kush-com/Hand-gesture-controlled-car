@@ -1,0 +1,246 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import socket
+import time
+from collections import deque
+
+# ===== Configuration =====
+RASPBERRY_PI_IP = "192.168.x.x"  # Change to your Raspberry Pi's IP
+RASPBERRY_PI_PORT = 5000
+SPEED_MAX_FORWARD = 255
+SPEED_MAX_BACKWARD = -255
+CALIBRATION_TIME = 5
+SMOOTHING_WINDOW = 5
+
+# ===== Mediapipe Setup =====
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.5
+)
+
+# ===== Global Variables =====
+calibration_data = None
+baseline_hand_open = None
+forward_backward_mapping = None
+left_right_mapping = None
+smoothing_queue_forward = deque(maxlen=SMOOTHING_WINDOW)
+smoothing_queue_left = deque(maxlen=SMOOTHING_WINDOW)
+
+# ===== Socket Connection =====
+def connect_to_rpi():
+    """Connect to Raspberry Pi via socket"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((RASPBERRY_PI_IP, RASPBERRY_PI_PORT))
+        print(f"✓ Connected to Raspberry Pi at {RASPBERRY_PI_IP}:{RASPBERRY_PI_PORT}")
+        return sock
+    except Exception as e:
+        print(f"✗ Failed to connect to Raspberry Pi: {e}")
+        return None
+
+def send_command(sock, forward_speed, left_right_value):
+    """Send speed command to Raspberry Pi"""
+    try:
+        # Clamp values
+        forward_speed = np.clip(forward_speed, SPEED_MAX_BACKWARD, SPEED_MAX_FORWARD)
+        left_right_value = np.clip(left_right_value, -100, 100)
+        
+        # Format: "FORWARD,LEFTRIGHT"
+        command = f"{int(forward_speed)},{int(left_right_value)}\n"
+        sock.sendall(command.encode())
+    except Exception as e:
+        print(f"✗ Error sending command: {e}")
+
+# ===== Calibration Functions =====
+def calibrate_stop_position(frame, hand_landmarks, start_time):
+    """Calibrate the stop position (closed fist) for first 5 seconds"""
+    elapsed = time.time() - start_time
+    remaining = CALIBRATION_TIME - elapsed
+    
+    # Get hand landmarks
+    h, w, c = frame.shape
+    landmarks = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks.landmark]
+    
+    # Display calibration message
+    cv2.putText(frame, f"CALIBRATION: Show closed fist", (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame, f"Time remaining: {remaining:.1f}s", (20, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
+    if remaining <= 0:
+        # Calibration complete
+        y_values = [lm.y for lm in hand_landmarks.landmark]
+        calibration_data = {
+            'y_12': y_values[12],  # Middle finger MCP
+            'y_0': y_values[0],    # Wrist
+            'hand_open': calculate_hand_openness(hand_landmarks)
+        }
+        print(f"✓ Calibration complete! Y_12: {y_values[12]:.3f}, Y_0: {y_values[0]:.3f}")
+        return calibration_data
+    
+    return None
+
+def calculate_hand_openness(hand_landmarks):
+    """Calculate hand openness using finger tip distances from palm center"""
+    # Extract key landmarks
+    palm_center_x = (hand_landmarks.landmark[0].x + hand_landmarks.landmark[9].x) / 2
+    palm_center_y = (hand_landmarks.landmark[0].y + hand_landmarks.landmark[9].y) / 2
+    
+    # Fingertips: 4 (thumb), 8 (index), 12 (middle), 16 (ring), 20 (pinky)
+    fingertips = [4, 8, 12, 16, 20]
+    total_distance = 0
+    
+    for tip in fingertips:
+        dx = hand_landmarks.landmark[tip].x - palm_center_x
+        dy = hand_landmarks.landmark[tip].y - palm_center_y
+        distance = np.sqrt(dx**2 + dy**2)
+        total_distance += distance
+    
+    return total_distance / len(fingertips)
+
+# ===== Mapping Functions =====
+def create_forward_backward_mapping(calibration_data):
+    """Create linear mapping for forward/backward motion"""
+    y_12 = calibration_data['y_12']
+    y_0 = calibration_data['y_0']
+    hand_range = abs(y_12 - y_0)
+    
+    return {
+        'y_0': y_0,
+        'y_12': y_12,
+        'range': hand_range
+    }
+
+def create_left_right_mapping(hand_landmarks):
+    """Create mapping for left/right motion using wrist x-position"""
+    # Use wrist (landmark 0) x-position relative to hand center
+    landmarks = hand_landmarks.landmark
+    wrist_x = landmarks[0].x
+    middle_finger_x = landmarks[12].x
+    hand_center_x = (wrist_x + middle_finger_x) / 2
+    
+    return {
+        'center_x': hand_center_x,
+        'range': 0.15  # Empirically determined range
+    }
+
+def map_forward_backward(hand_landmarks, calibration_data):
+    """Map hand Y-position to forward/backward speed"""
+    y_values = [lm.y for lm in hand_landmarks.landmark]
+    y_12 = y_values[12]
+    y_0 = y_values[0]
+    
+    current_range = y_12 - y_0
+    calibration_range = calibration_data['y_12'] - calibration_data['y_0']
+    
+    # Linear interpolation
+    # When current_range = calibration_range, speed = 0 (stop)
+    # When current_range = 0 (fist closed), speed = SPEED_MAX_FORWARD
+    # When current_range > calibration_range, speed = SPEED_MAX_BACKWARD
+    
+    if calibration_range != 0:
+        normalized = (calibration_range - current_range) / calibration_range
+        speed = normalized * SPEED_MAX_FORWARD
+    else:
+        speed = 0
+    
+    return speed
+
+def map_left_right(hand_landmarks):
+    """Map hand X-position to left/right steering"""
+    landmarks = hand_landmarks.landmark
+    wrist_x = landmarks[0].x
+    hand_center_x = (landmarks[0].x + landmarks[9].x) / 2
+    
+    # Deviation from center
+    deviation = (wrist_x - hand_center_x) / 0.15
+    left_right_value = np.clip(deviation * 100, -100, 100)
+    
+    return left_right_value
+
+# ===== Main Loop =====
+def main():
+    global calibration_data, baseline_hand_open, forward_backward_mapping
+    
+    cap = cv2.VideoCapture(0)
+    
+    # Connect to Raspberry Pi
+    sock = connect_to_rpi()
+    if sock is None:
+        print("Cannot proceed without Raspberry Pi connection")
+        return
+    
+    calibration_start = time.time()
+    calibration_complete = False
+    
+    print("Starting gesture control...")
+    print("Step 1: Show closed fist for calibration (5 seconds)")
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb_frame)
+        
+        if results.hand_landmarks and len(results.hand_landmarks) > 0:
+            hand_landmarks = results.hand_landmarks[0]
+            
+            # Draw hand landmarks
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            
+            if not calibration_complete:
+                # Calibration phase
+                calibration_data = calibrate_stop_position(frame, hand_landmarks, calibration_start)
+                if calibration_data is not None:
+                    calibration_complete = True
+                    forward_backward_mapping = create_forward_backward_mapping(calibration_data)
+                    print("\nStep 2: Gesture control active!")
+                    print("- Tilt hand forward/backward for speed")
+                    print("- Rotate wrist left/right for steering")
+            else:
+                # Control phase
+                forward_speed = map_forward_backward(hand_landmarks, calibration_data)
+                left_right_value = map_left_right(hand_landmarks)
+                
+                # Apply smoothing
+                smoothing_queue_forward.append(forward_speed)
+                smoothing_queue_left.append(left_right_value)
+                
+                smoothed_forward = np.mean(list(smoothing_queue_forward))
+                smoothed_left = np.mean(list(smoothing_queue_left))
+                
+                # Send command
+                send_command(sock, smoothed_forward, smoothed_left)
+                
+                # Display info
+                cv2.putText(frame, f"Forward: {smoothed_forward:.0f}", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Left/Right: {smoothed_left:.0f}", (20, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            if calibration_complete:
+                cv2.putText(frame, "Hand not detected - sending STOP", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                send_command(sock, 0, 0)
+        
+        cv2.imshow("Gesture-Controlled Car", frame)
+        
+        if cv2.waitKey(10) & 0xFF == ord('q'):
+            print("\nShutting down...")
+            send_command(sock, 0, 0)
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    sock.close()
+
+if __name__ == "__main__":
+    main()
